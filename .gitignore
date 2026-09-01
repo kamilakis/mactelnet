@@ -1,0 +1,9 @@
+# Built binaries at the repo root only -- an unanchored "mactelnet" would also
+# match cmd/mactelnet/ and bin/mactelnet.
+/mactelnet
+/mactelnet.exe
+
+# Local drafts, not part of the project.
+/ISSUE-100-REPLY.md
+/UPSTREAM-NOTE.md
+/MIKROTIK-NOTE.md

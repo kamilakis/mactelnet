@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# mactelnet — run MacTelnet.ps1 on a remote Windows box over SSH.
+#
+# OPTIONAL CONVENIENCE. MacTelnet.ps1 is a self-contained Windows PowerShell
+# script: you can equally copy it to the box and run it by hand. This wrapper
+# just saves the interactive login.
+#
+# WHY IT IS NOT JUST `psh`: the script is ~26 KB, and psh passes scripts as
+# `-EncodedCommand`, which blows Windows' command-line length limit ("exec
+# request failed on channel 0"). scp is out too — these boxes have no sftp
+# subsystem. So we send a tiny bootstrap as -EncodedCommand and stream the
+# script itself over ssh stdin, where there is no length limit. The bootstrap
+# rebuilds it as a scriptblock in memory, so nothing is written to the client's
+# disk and there is nothing to clean up.
+#
+# Usage:
+#   mactelnet <ssh-target> --selftest
+#   mactelnet <ssh-target> --discover
+#   mactelnet <ssh-target> --probe-auth <MAC> <count>   # dump the auth challenge
+#   mactelnet <ssh-target> --mac <MAC> [--user admin] [-v] -- '<cli>' ['<cli>' ...]
+#
+# Password: $MT_PASSWORD if set, otherwise prompted (never echoed, never stored).
+#
+# Examples:
+#   mactelnet windows-host --discover
+#   mactelnet windows-host --mac 00:00:5E:00:53:01 -- '/system identity print'
+#
+# CAVEAT: the bootstrap carries the password in the remote process's command
+# line for the few seconds the run lasts. Fine on a single-user POS box; know it.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PS_FILE="$DIR/MacTelnet.ps1"
+[[ -f "$PS_FILE" ]] || { echo "mactelnet: missing $PS_FILE" >&2; exit 2; }
+
+TARGET=""; MODE=""; MAC=""; USERNAME="admin"; VERBOSE=""; TIMEOUT=""; LOCALIP=""; RAWOUT=""
+VARIANT=""; TERMTYPE=""; PROBEUSER=""; LEGACY=""; TRACE=""
+SSH_OPTS=(); CMDS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --selftest)   MODE="selftest"; shift;;
+    --discover)   MODE="discover"; shift;;
+    --mac)        MODE="command"; MAC="${2-}"; shift 2;;
+    --user)       USERNAME="${2-}"; shift 2;;
+    --timeout)    TIMEOUT="${2-}"; shift 2;;
+    --local-ip)   LOCALIP="${2-}"; shift 2;;
+    --raw)        RAWOUT=1; shift;;
+    --legacy)     LEGACY=1; shift;;
+    --trace)      TRACE=1; shift;;
+    --variant)    VARIANT="${2-}"; shift 2;;
+    --term)       TERMTYPE="${2-}"; shift 2;;
+    --probe-user) PROBEUSER="${2-}"; shift 2;;
+    --probe-auth) MODE="probe"; MAC="${2-}"; PROBES="${3:-3}"; shift 3;;
+    -v|--verbose) VERBOSE=1; shift;;
+    -h|--help)    sed -n '2,30p' "$0"; exit 0;;
+    -o|-p|-i|-F|-J) SSH_OPTS+=("$1" "${2-}"); shift 2;;
+    --)           shift; while [[ $# -gt 0 ]]; do CMDS+=("$1"); shift; done;;
+    -*)           echo "mactelnet: unknown flag $1" >&2; exit 2;;
+    *)            if [[ -z "$TARGET" ]]; then TARGET="$1"; else CMDS+=("$1"); fi; shift;;
+  esac
+done
+
+[[ -n "$TARGET" ]] || { echo "mactelnet: no ssh target given" >&2; exit 2; }
+[[ -n "$MODE"   ]] || { echo "mactelnet: give --selftest, --discover or --mac <MAC>" >&2; exit 2; }
+
+# Quote a bash string as a PowerShell single-quoted literal.
+psq() { printf "'%s'" "${1//\'/\'\'}"; }
+
+ARGS=""
+case "$MODE" in
+  selftest) ARGS="-SelfTest";;
+  discover) ARGS="-Discover";;
+  probe)
+    [[ -n "$MAC" ]] || { echo "mactelnet: --probe-auth needs <MAC> <count>" >&2; exit 2; }
+    ARGS="-Target $(psq "$MAC") -ProbeAuth $PROBES"
+    [[ -n "$PROBEUSER" ]] && ARGS+=" -ProbeUser $(psq "$PROBEUSER")"
+    ;;
+  command)
+    [[ -n "$MAC" ]]         || { echo "mactelnet: --mac needs a value" >&2; exit 2; }
+    [[ ${#CMDS[@]} -gt 0 ]] || { echo "mactelnet: no commands given (use -- '<cli line>')" >&2; exit 2; }
+    if [[ -z "${MT_PASSWORD:-}" ]]; then
+      read -rsp "RouterOS password for $USERNAME@$MAC: " MT_PASSWORD; echo >&2
+    fi
+    LIST=""
+    for c in "${CMDS[@]}"; do LIST+="$(psq "$c"),"; done
+    ARGS="-Target $(psq "$MAC") -User $(psq "$USERNAME") -Password $(psq "$MT_PASSWORD") -Command ${LIST%,}"
+    ;;
+esac
+
+[[ -n "$TIMEOUT" ]] && ARGS+=" -TimeoutMs $TIMEOUT"
+[[ -n "$LOCALIP" ]] && ARGS+=" -LocalIP $(psq "$LOCALIP")"
+[[ -n "$VARIANT"  ]] && ARGS+=" -AuthVariant $VARIANT"
+[[ -n "$TERMTYPE" ]] && ARGS+=" -TermType $(psq "$TERMTYPE")"
+[[ -n "$LEGACY"  ]] && ARGS+=" -Legacy"
+[[ -n "$TRACE"   ]] && ARGS+=" -Trace"
+[[ -n "$RAWOUT"  ]] && ARGS+=" -Raw"
+[[ -n "$VERBOSE" ]] && ARGS+=" -Verbose"
+
+# The bootstrap: read base64 from stdin, rebuild the script as a scriptblock,
+# invoke it with our arguments. Small enough to fit a command line comfortably.
+# Errors are caught and reported on stdout, so stderr carries nothing but noise.
+BOOTSTRAP=$(cat <<PSEOF
+\$ErrorActionPreference = 'Stop'
+\$b64 = [Console]::In.ReadToEnd()
+\$src = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\$b64))
+\$sb  = [ScriptBlock]::Create(\$src)
+try { & \$sb $ARGS } catch { Write-Output ("ERROR: " + \$_.Exception.Message); exit 1 }
+PSEOF
+)
+
+ENC="$(printf '%s' "$BOOTSTRAP" | iconv -t UTF-16LE | base64 -w0)"
+
+# Keep stderr OUT of stdout. PowerShell serialises its host/progress stream to
+# stderr as one enormous CLIXML line; merged with 2>&1 it lands mid-line and a
+# line-based filter then eats real output along with it. Filter it in its own
+# stream, so genuine ssh errors still surface.
+base64 -w0 "$PS_FILE" \
+  | ssh "${SSH_OPTS[@]}" "$TARGET" "powershell -NoProfile -EncodedCommand $ENC" \
+      2> >(sed -E '/^#< CLIXML/d; /^<Objs /d' >&2)
+exit "${PIPESTATUS[1]}"
