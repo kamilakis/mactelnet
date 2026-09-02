@@ -1,0 +1,6 @@
+# GitHub picks a repository's language by byte count, and MacTelnet.ps1 is
+# larger than the whole Go client -- which labels this a PowerShell project when
+# the Go binary is the tool. Keep the .ps1 out of the statistics; it is still in
+# the repo, documented, and supported.
+MacTelnet.ps1 linguist-detectable=false
+bin/mactelnet linguist-detectable=false
