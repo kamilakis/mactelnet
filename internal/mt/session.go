@@ -22,13 +22,21 @@ var retransmit = []time.Duration{
 var ErrClosed = errors.New("device closed the session")
 
 // Session is one MAC-Telnet conversation. Terminal output arrives on Output();
-// Write sends keystrokes or commands. Safe for one reader and one writer.
+// Write sends keystrokes or commands, and is safe to call from several
+// goroutines at once.
 type Session struct {
 	conn   *net.UDPConn
 	remote *net.UDPAddr
 	src    net.HardwareAddr
 	dst    net.HardwareAddr
 	key    uint16
+
+	// wmu serialises Write: the counter it claims is only valid if no other
+	// Write is in flight. interactive() writes from three goroutines (the
+	// stdin reader, the probe answerer and the Ctrl-C handler), and without
+	// this they hand the device two payloads under one counter, the ACK never
+	// reaches either one, and both spin until they time out.
+	wmu sync.Mutex
 
 	mu         sync.Mutex
 	outCounter uint32
@@ -200,8 +208,13 @@ func (s *Session) Start(timeout time.Duration) error {
 }
 
 // Write sends a DATA packet and walks the retransmit ladder until the device
-// acknowledges past it.
+// acknowledges past it. Calls are serialised: only one payload may be in flight,
+// because the device tracks the stream by byte counter and two writers claiming
+// the same counter corrupt it for both.
 func (s *Session) Write(payload []byte) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+
 	s.mu.Lock()
 	start := s.outCounter
 	s.mu.Unlock()
@@ -212,20 +225,29 @@ func (s *Session) Write(payload []byte) error {
 		if err := s.send(PtData, payload, start); err != nil {
 			return err
 		}
-		select {
-		case <-s.acked:
-		case <-s.done:
-			return ErrClosed
-		case <-time.After(retransmit[min(i, len(retransmit)-1)]):
-		}
-		s.mu.Lock()
-		got := s.lastAck
-		s.mu.Unlock()
-		if got >= want {
-			s.mu.Lock()
-			s.outCounter = uint32(want)
-			s.mu.Unlock()
-			return nil
+		// Sit out the whole rung. An ACK that does not yet cover this payload
+		// is not a reason to retransmit -- the device ACKs every packet it
+		// sends us, so resending on each one turns the ladder into a flood.
+		rung := time.NewTimer(retransmit[min(i, len(retransmit)-1)])
+		for waiting := true; waiting; {
+			select {
+			case <-s.acked:
+				s.mu.Lock()
+				got := s.lastAck
+				s.mu.Unlock()
+				if got >= want {
+					rung.Stop()
+					s.mu.Lock()
+					s.outCounter = uint32(want)
+					s.mu.Unlock()
+					return nil
+				}
+			case <-s.done:
+				rung.Stop()
+				return ErrClosed
+			case <-rung.C:
+				waiting = false
+			}
 		}
 		if time.Now().After(deadline) {
 			return errors.New("no ack for a data packet -- device stopped answering")

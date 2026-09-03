@@ -236,14 +236,16 @@ func clean(text, cmd string) string {
 // here -- bytes go through untouched in both directions.
 func interactive(s *mt.Session, o opts) error {
 	fd := int(os.Stdin.Fd())
+	raw := false
 	if term.IsTerminal(fd) {
 		state, err := term.MakeRaw(fd)
 		if err != nil {
 			return fmt.Errorf("raw mode: %w", err)
 		}
 		defer term.Restore(fd, state)
+		raw = true
 
-		if w, h, err := term.GetSize(fd); err == nil && w > 0 {
+		if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
 			o.width, o.height = w, h
 		}
 	}
@@ -262,7 +264,11 @@ func interactive(s *mt.Session, o opts) error {
 		for {
 			n, err := os.Stdin.Read(buf)
 			if n > 0 {
-				if err := s.Write(append([]byte(nil), buf[:n]...)); err != nil {
+				if werr := s.Write(append([]byte(nil), buf[:n]...)); werr != nil {
+					// Say so. Returning quietly leaves a live session that
+					// prints output and swallows every keystroke, which reads
+					// as "the terminal is dead" with no clue why.
+					fmt.Fprintf(os.Stderr, "\r\nkeyboard input stopped: %v\r\n", werr)
 					return
 				}
 			}
@@ -275,8 +281,13 @@ func interactive(s *mt.Session, o opts) error {
 	for {
 		select {
 		case b := <-s.Output():
-			// Answer the size probe in case the local terminal will not.
-			s.AnswerProbes(b, o.width, o.height)
+			// Only answer the size probe when nothing else will. A raw local
+			// terminal answers it itself and the reply comes back through
+			// stdin, so answering as well sends the device two replies -- and
+			// the two writers race for the same stream counter.
+			if !raw {
+				s.AnswerProbes(b, o.width, o.height)
+			}
 			if _, err := os.Stdout.Write(b); err != nil {
 				return err
 			}

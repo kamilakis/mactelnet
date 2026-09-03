@@ -66,6 +66,14 @@ Two constraints worth knowing:
 
 It needs no privileges: broadcast mode requires no raw sockets.
 
+On Windows the first run still raises the Windows Defender Firewall prompt,
+because the client listens on UDP for the device's replies. Accepting it needs
+an administrator, which is why an unelevated console appears to hang: the
+outbound broadcast leaves, every reply is dropped, and discovery finds nothing.
+Accept it once (keep *Private networks* ticked) and unelevated runs work from
+then on. The allow rule is bound to the exact path of the `.exe`, so moving or
+renaming the binary asks again.
+
 ## Why MD5 clients fail
 
 RouterOS still performs the legacy handshake, and then rejects every answer to
